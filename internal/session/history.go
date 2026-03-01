@@ -2,6 +2,7 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -109,7 +110,9 @@ func ScanSessionHistory(claudeDir string) ([]HistoricalSession, error) {
 	return sessions, nil
 }
 
-// enrichHistoricalSession reads the JSONL file to extract metadata
+// enrichHistoricalSession reads the JSONL file to extract metadata.
+// The slug field can appear anywhere in the file (often hundreds of lines in),
+// so we scan the full file but only parse minimal JSON for most lines.
 func enrichHistoricalSession(sess *HistoricalSession) {
 	f, err := os.Open(sess.FilePath)
 	if err != nil {
@@ -117,20 +120,33 @@ func enrichHistoricalSession(sess *HistoricalSession) {
 	}
 	defer f.Close()
 
-	// Read first 30 lines to extract metadata
 	scanner := bufio.NewScanner(f)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024) // 1MB buffer for safety
 
 	lineCount := 0
-	headLines := 30
 	firstUserFound := false
+	// We gather basic metadata (version, branch, createdAt, first prompt) from early lines,
+	// but keep scanning for slug since it often appears after line 300+.
+	metadataComplete := false
 
-	for scanner.Scan() && lineCount < headLines {
+	for scanner.Scan() {
 		lineCount++
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
+		}
+
+		// Once we have all metadata except slug, only parse lines that contain "slug"
+		if metadataComplete && sess.Slug != "" {
+			continue // just counting lines
+		}
+
+		// Fast path: if we only need slug, skip lines without it
+		if metadataComplete && sess.Slug == "" {
+			if !bytes.Contains(line, []byte(`"slug"`)) {
+				continue
+			}
 		}
 
 		var record historyRecord
@@ -138,42 +154,40 @@ func enrichHistoricalSession(sess *HistoricalSession) {
 			continue
 		}
 
-		// Extract slug from system entries
+		// Extract slug (can appear in any entry type — progress, system, etc.)
 		if sess.Slug == "" && record.Slug != "" {
 			sess.Slug = record.Slug
 		}
 
-		// Extract version
-		if sess.ClaudeVersion == "" && record.Version != "" {
-			sess.ClaudeVersion = record.Version
-		}
+		// These fields are typically in early lines
+		if !metadataComplete {
+			if sess.ClaudeVersion == "" && record.Version != "" {
+				sess.ClaudeVersion = record.Version
+			}
 
-		// Extract git branch
-		if sess.GitBranch == "" && record.GitBranch != "" {
-			sess.GitBranch = record.GitBranch
-		}
+			if sess.GitBranch == "" && record.GitBranch != "" {
+				sess.GitBranch = record.GitBranch
+			}
 
-		// Extract CreatedAt from first timestamp
-		if sess.CreatedAt.IsZero() && record.Timestamp != "" {
-			if t, parseErr := time.Parse(time.RFC3339, record.Timestamp); parseErr == nil {
-				sess.CreatedAt = t
+			if sess.CreatedAt.IsZero() && record.Timestamp != "" {
+				if t, parseErr := time.Parse(time.RFC3339, record.Timestamp); parseErr == nil {
+					sess.CreatedAt = t
+				}
+			}
+
+			if !firstUserFound && record.Type == "user" && len(record.Message) > 0 {
+				text := extractUserText(record.Message)
+				if text != "" {
+					sess.FirstPrompt = truncate(text, 200)
+					firstUserFound = true
+				}
+			}
+
+			// Check if basic metadata is done (don't keep parsing full records)
+			if firstUserFound && sess.ClaudeVersion != "" && sess.GitBranch != "" {
+				metadataComplete = true
 			}
 		}
-
-		// Extract first user prompt
-		if !firstUserFound && record.Type == "user" && len(record.Message) > 0 {
-			text := extractUserText(record.Message)
-			if text != "" {
-				sess.FirstPrompt = truncate(text, 200)
-				firstUserFound = true
-			}
-		}
-	}
-
-	// Count total lines (approximate message count)
-	// Continue scanning from where we left off
-	for scanner.Scan() {
-		lineCount++
 	}
 	sess.MessageCount = lineCount
 
@@ -299,14 +313,37 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-// dirNameToProjectPath converts a Claude project directory name back to a path.
-// The directory name format replaces "/" with "-" (e.g., "-home-skhoury" for "/home/skhoury").
-// This conversion is lossy for paths that contain actual hyphens.
+// dirNameToProjectPath converts a Claude project directory name back to a display path.
+// Claude uses ConvertToClaudeDirName() which replaces ALL non-alphanumeric chars with "-".
+// This means "-home-skhoury-my-project" and "/home/skhoury/my-project" both map to the same dir name.
+// Reverse mapping is inherently lossy, so we try to reconstruct using the home directory
+// and fall back to showing the raw dir name with "/" separators.
 func dirNameToProjectPath(dirName string) string {
 	if dirName == "" {
 		return ""
 	}
-	// Replace leading "-" with "/", then remaining "-" with "/"
+
+	// Try to match against actual home directory for accurate reconstruction
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		homeConverted := ConvertToClaudeDirName(home)
+		if strings.HasPrefix(dirName, homeConverted) {
+			rest := strings.TrimPrefix(dirName, homeConverted)
+			if rest == "" {
+				return "~"
+			}
+			// rest starts with "-" (separator), convert to "/"
+			// Note: consecutive hyphens (from special chars like "~") become "//"
+			// so we clean those up
+			restPath := strings.ReplaceAll(rest, "-", "/")
+			for strings.Contains(restPath, "//") {
+				restPath = strings.ReplaceAll(restPath, "//", "/")
+			}
+			return "~" + restPath
+		}
+	}
+
+	// Fallback: simple replacement (lossy but reasonable)
 	if strings.HasPrefix(dirName, "-") {
 		return "/" + strings.ReplaceAll(dirName[1:], "-", "/")
 	}

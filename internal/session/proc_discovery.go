@@ -104,6 +104,13 @@ func inspectProcPID(pid int, managedSessionIDs map[string]bool) (ExternalProcess
 		return ExternalProcess{}, false
 	}
 
+	// Skip sandbox wrappers — bwrap cmdlines contain "/tmp/claude" as a directory
+	// path (e.g., --bind /tmp/claude /tmp/claude), which false-matches "claude" basename.
+	firstBase := filepath.Base(args[0])
+	if firstBase == "bwrap" || firstBase == "socat" || firstBase == "bash" || firstBase == "sh" {
+		return ExternalProcess{}, false
+	}
+
 	tool, found := isAgentProcess(args)
 	if !found {
 		return ExternalProcess{}, false
@@ -201,11 +208,25 @@ func splitNull(data []byte) []string {
 // isAgentProcess checks if any arg's basename matches a known agent tool.
 // Returns (toolName, true) if found.
 func isAgentProcess(args []string) (string, bool) {
-	for _, arg := range args {
+	// Only check the first arg (the executable) and any arg that starts with
+	// a typical bin path. Avoid matching directory paths like "/tmp/claude".
+	for i, arg := range args {
 		base := filepath.Base(arg)
 		for _, tool := range knownAgentTools {
 			if base == tool {
-				return tool, true
+				// For arg[0], always trust it (it's the executable)
+				if i == 0 {
+					return tool, true
+				}
+				// For other args, only match if the arg looks like an executable path
+				// (contains /bin/ or /node_modules/.bin/) not a plain directory
+				if strings.Contains(arg, "/bin/") || strings.Contains(arg, "node_modules") {
+					return tool, true
+				}
+				// Also match bare command names (no path component)
+				if !strings.Contains(arg, "/") {
+					return tool, true
+				}
 			}
 		}
 	}

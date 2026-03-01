@@ -395,20 +395,32 @@ func TestExtractTextContent(t *testing.T) {
 }
 
 func TestDirNameToProjectPath(t *testing.T) {
-	tests := []struct {
-		dirName  string
-		expected string
-	}{
-		{"-home-skhoury", "/home/skhoury"},
-		{"-Users-master-Code", "/Users/master/Code"},
-		{"", ""},
-		{"-home-user-my-project", "/home/user/my/project"},
+	// The function uses os.UserHomeDir() for home detection.
+	// On this machine, home-relative paths are returned as "~/..."
+	home, _ := os.UserHomeDir()
+	homeConverted := ConvertToClaudeDirName(home)
+
+	// Always test: empty string and non-home paths
+	result := dirNameToProjectPath("")
+	if result != "" {
+		t.Errorf("dirNameToProjectPath(\"\") = %q, want \"\"", result)
 	}
 
-	for _, tc := range tests {
-		result := dirNameToProjectPath(tc.dirName)
-		if result != tc.expected {
-			t.Errorf("dirNameToProjectPath(%q) = %q, want %q", tc.dirName, result, tc.expected)
+	result = dirNameToProjectPath("-tmp-test")
+	if result != "/tmp/test" {
+		t.Errorf("dirNameToProjectPath(\"-tmp-test\") = %q, want \"/tmp/test\"", result)
+	}
+
+	// Home-relative tests (depend on actual home dir)
+	if home != "" {
+		result = dirNameToProjectPath(homeConverted)
+		if result != "~" {
+			t.Errorf("dirNameToProjectPath(%q) = %q, want \"~\"", homeConverted, result)
+		}
+
+		result = dirNameToProjectPath(homeConverted + "-my-project")
+		if result != "~/my/project" {
+			t.Errorf("dirNameToProjectPath(%q) = %q, want \"~/my/project\"", homeConverted+"-my-project", result)
 		}
 	}
 }
