@@ -254,6 +254,12 @@ func main() {
 		case "worktree", "wt":
 			handleWorktree(profile, args[1:])
 			return
+		case "discover":
+			handleDiscover(profile, args[1:])
+			return
+		case "history":
+			handleHistory(profile, args[1:])
+			return
 		case "web":
 			webEnabled = true
 			webArgs = append(webArgs, args[1:]...)
@@ -2007,6 +2013,8 @@ func printHelp() {
 	fmt.Println("  codex-hooks      Manage Codex notify hook integration")
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  worktree, wt     Manage git worktrees")
+	fmt.Println("  discover         Find agent sessions running outside agent-deck")
+	fmt.Println("  history          Browse and resume historical Claude sessions")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
 	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
 	fmt.Println("  profile          Manage profiles")

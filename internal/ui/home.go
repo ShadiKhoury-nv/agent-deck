@@ -315,6 +315,17 @@ type Home struct {
 	// UI state persistence across restarts
 	pendingCursorRestore *uiState // Consumed on first loadSessionsMsg to restore cursor
 	uiStateSaveTicks     int      // Counter for periodic UI state saves in tick handler
+
+	// External process discovery (non-managed agent sessions)
+	externalProcesses        []session.ExternalProcess // Discovered external agent processes
+	externalSectionCollapsed bool                      // Whether the external section is collapsed
+	lastExternalDiscovery    time.Time                 // Throttle discovery to every 10 seconds
+
+	// History view mode
+	historyMode   bool                        // True when viewing session history
+	historyIndex  *session.HistoryIndex       // Cached history index
+	historyCursor int                         // Cursor position in history view
+	historyScroll int                         // Scroll offset in history view
 }
 
 // reloadState preserves UI state during storage reload
@@ -462,6 +473,18 @@ type worktreeFinishResultMsg struct {
 	targetBranch string
 	merged       bool
 	err          error
+}
+
+// externalProcessesMsg is sent when async external process discovery completes
+type externalProcessesMsg struct {
+	processes []session.ExternalProcess
+	err       error
+}
+
+// historyLoadedMsg is sent when async history index loading completes
+type historyLoadedMsg struct {
+	index *session.HistoryIndex
+	err   error
 }
 
 // statusUpdateRequest is sent to the background worker with current viewport info
@@ -935,6 +958,25 @@ func (h *Home) rebuildFlatItems() {
 		if h.flatItems[i].Type == session.ItemTypeGroup && h.flatItems[i].Level == 0 {
 			rootNum++
 			h.flatItems[i].RootGroupNum = rootNum
+		}
+	}
+
+	// Append external (non-managed) process section if any discovered
+	if len(h.externalProcesses) > 0 {
+		// Add section header
+		h.flatItems = append(h.flatItems, session.Item{
+			Type:  session.ItemTypeExternalHeader,
+			Level: 0,
+		})
+		// Add external processes if section is expanded
+		if !h.externalSectionCollapsed {
+			for i := range h.externalProcesses {
+				h.flatItems = append(h.flatItems, session.Item{
+					Type:     session.ItemTypeExternal,
+					External: &h.externalProcesses[i],
+					Level:    1,
+				})
+			}
 		}
 	}
 
@@ -3053,6 +3095,26 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case externalProcessesMsg:
+		if msg.err != nil {
+			uiLog.Debug("external_discovery_failed", slog.String("error", msg.err.Error()))
+		} else {
+			h.externalProcesses = msg.processes
+			h.rebuildFlatItems()
+		}
+		return h, nil
+
+	case historyLoadedMsg:
+		if msg.err != nil {
+			h.setError(fmt.Errorf("failed to load history: %v", msg.err))
+			h.historyMode = false
+		} else {
+			h.historyIndex = msg.index
+			h.historyCursor = 0
+			h.historyScroll = 0
+		}
+		return h, nil
+
 	case tickMsg:
 		// Auto-dismiss errors after 5 seconds
 		if h.err != nil && !h.errTime.IsZero() && time.Since(h.errTime) > 5*time.Second {
@@ -3167,7 +3229,15 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			h.previewCacheMu.Unlock()
 		}
-		return h, tea.Batch(h.tick(), previewCmd)
+		// Periodic external process discovery (every 10 seconds)
+		var externalCmd tea.Cmd
+		const externalDiscoveryInterval = 10 * time.Second
+		if time.Since(h.lastExternalDiscovery) >= externalDiscoveryInterval {
+			h.lastExternalDiscovery = time.Now()
+			externalCmd = h.discoverExternalProcesses()
+		}
+
+		return h, tea.Batch(h.tick(), previewCmd, externalCmd)
 
 	case globalSearchDebounceMsg, globalSearchResultsMsg:
 		// Route async global search messages to the global search component
@@ -3280,6 +3350,11 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if h.worktreeFinishDialog.IsVisible() {
 			return h.handleWorktreeFinishDialogKey(msg)
+		}
+
+		// History view keys (modal when historyMode is active)
+		if h.historyMode {
+			return h.handleHistoryKey(msg)
 		}
 
 		// Main view keys
@@ -3688,6 +3763,20 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case "H": // Toggle history view
+		if h.historyMode {
+			h.historyMode = false
+			return h, nil
+		}
+		h.historyMode = true
+		h.historyCursor = 0
+		h.historyScroll = 0
+		// Load history asynchronously if not cached
+		if h.historyIndex == nil {
+			return h, h.loadHistory()
+		}
+		return h, nil
+
 	case "enter":
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -3708,6 +3797,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 				h.saveGroupState()
+			} else if item.Type == session.ItemTypeExternalHeader {
+				// Toggle external section collapse
+				h.externalSectionCollapsed = !h.externalSectionCollapsed
+				h.rebuildFlatItems()
 			}
 		}
 		return h, nil
@@ -3727,6 +3820,9 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 				h.saveGroupState()
+			} else if item.Type == session.ItemTypeExternalHeader {
+				h.externalSectionCollapsed = !h.externalSectionCollapsed
+				h.rebuildFlatItems()
 			}
 		}
 		return h, nil
@@ -5363,6 +5459,62 @@ func (h *Home) importSessions() tea.Msg {
 	return loadSessionsMsg{instances: instancesCopy, restoreState: &state}
 }
 
+// discoverExternalProcesses returns a tea.Cmd that discovers running agent processes
+// not managed by agent-deck. Results are sent back as externalProcessesMsg.
+func (h *Home) discoverExternalProcesses() tea.Cmd {
+	return func() tea.Msg {
+		// Build set of managed session IDs
+		managedIDs := make(map[string]bool)
+		h.instancesMu.RLock()
+		for _, inst := range h.instances {
+			if inst.ClaudeSessionID != "" {
+				managedIDs[inst.ClaudeSessionID] = true
+			}
+		}
+		h.instancesMu.RUnlock()
+
+		procs, err := session.DiscoverRunningProcesses(managedIDs)
+		if err != nil {
+			return externalProcessesMsg{err: err}
+		}
+
+		// Filter out managed processes
+		var external []session.ExternalProcess
+		for _, p := range procs {
+			if !p.IsManaged {
+				external = append(external, p)
+			}
+		}
+
+		return externalProcessesMsg{processes: external}
+	}
+}
+
+// loadHistory returns a tea.Cmd that loads the session history index
+func (h *Home) loadHistory() tea.Cmd {
+	return func() tea.Msg {
+		claudeDir := session.GetClaudeConfigDir()
+		cacheDir := filepath.Join(claudeDir, ".cache")
+		index, err := session.LoadOrRefreshIndex(claudeDir, cacheDir)
+		if err != nil {
+			return historyLoadedMsg{err: err}
+		}
+		return historyLoadedMsg{index: index}
+	}
+}
+
+// getSelectedExternal returns the external process at cursor, or nil
+func (h *Home) getSelectedExternal() *session.ExternalProcess {
+	if len(h.flatItems) == 0 || h.cursor >= len(h.flatItems) {
+		return nil
+	}
+	item := h.flatItems[h.cursor]
+	if item.Type == session.ItemTypeExternal {
+		return item.External
+	}
+	return nil
+}
+
 // countSessionStatuses counts sessions by status for the logo display
 // Uses cache to avoid O(n) iteration on every View() call
 // Cache expires after 500ms to balance freshness with performance
@@ -5609,6 +5761,11 @@ func (h *Home) View() string {
 	}
 	if h.worktreeFinishDialog.IsVisible() {
 		return h.worktreeFinishDialog.View()
+	}
+
+	// History view (full-screen overlay when H is pressed)
+	if h.historyMode {
+		return h.renderHistoryView()
 	}
 
 	// Reuse viewBuilder to reduce allocations (reset and pre-allocate)
@@ -6673,6 +6830,17 @@ func (h *Home) renderHelpBarFull() string {
 				h.helpKey("r", "Rename"),
 				h.helpKey("d", "Delete"),
 			}
+		} else if item.Type == session.ItemTypeExternalHeader {
+			contextTitle = "External"
+			primaryHints = []string{
+				h.helpKey("Enter", "Toggle"),
+				h.helpKey("H", "History"),
+			}
+		} else if item.Type == session.ItemTypeExternal {
+			contextTitle = "External"
+			primaryHints = []string{
+				h.helpKey("H", "History"),
+			}
 		} else {
 			contextTitle = "Session"
 			primaryHints = []string{
@@ -6740,7 +6908,7 @@ func (h *Home) renderHelpBarFull() string {
 	// Global shortcuts (right side) - more compact with separators
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	globalHints := globalStyle.Render("↑↓ Nav") + sep +
-		globalStyle.Render("/ Search  G Global") + sep +
+		globalStyle.Render("/ Search  G Global  H History") + sep +
 		globalStyle.Render("? Help  q Quit")
 
 	// Calculate spacing between left (context) and right (global) portions
@@ -6838,11 +7006,153 @@ func (h *Home) renderSessionList(width, height int) string {
 
 // renderItem renders a single item (group or session) for the left panel
 func (h *Home) renderItem(b *strings.Builder, item session.Item, selected bool, itemIndex int) {
-	if item.Type == session.ItemTypeGroup {
+	switch item.Type {
+	case session.ItemTypeGroup:
 		h.renderGroupItem(b, item, selected, itemIndex)
-	} else {
+	case session.ItemTypeExternalHeader:
+		h.renderExternalHeader(b, selected)
+	case session.ItemTypeExternal:
+		h.renderExternalItem(b, item, selected)
+	default:
 		h.renderSessionItem(b, item, selected)
 	}
+}
+
+// renderExternalHeader renders the "External (N not managed)" section header
+func (h *Home) renderExternalHeader(b *strings.Builder, selected bool) {
+	count := len(h.externalProcesses)
+
+	// Separator line above external section
+	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+	b.WriteString(sepStyle.Render("──"))
+	b.WriteString(" ")
+
+	// Expand/collapse indicator
+	var expandIcon string
+	nameStyle := lipgloss.NewStyle().Foreground(ColorComment).Bold(true)
+	countStyle := lipgloss.NewStyle().Foreground(ColorComment)
+	if selected {
+		nameStyle = GroupNameSelStyle
+		countStyle = GroupCountSelStyle
+	}
+
+	if h.externalSectionCollapsed {
+		expandIcon = "▸"
+	} else {
+		expandIcon = "▾"
+	}
+	if selected {
+		expandIcon = GroupExpandSelStyle.Render(expandIcon)
+	} else {
+		expandIcon = lipgloss.NewStyle().Foreground(ColorComment).Render(expandIcon)
+	}
+
+	label := nameStyle.Render("External")
+	countStr := countStyle.Render(fmt.Sprintf(" (%d not managed)", count))
+
+	b.WriteString(expandIcon)
+	b.WriteString(" ")
+	b.WriteString(label)
+	b.WriteString(countStr)
+	b.WriteString("\n")
+}
+
+// renderExternalItem renders a single external (non-managed) process entry
+func (h *Home) renderExternalItem(b *strings.Builder, item session.Item, selected bool) {
+	proc := item.External
+	if proc == nil {
+		return
+	}
+
+	// Selection indicator
+	selectionPrefix := " "
+	if selected {
+		selectionPrefix = SessionSelectionPrefix.Render("▶")
+	}
+
+	// External process icon (distinguishes from managed sessions)
+	extIcon := "⊙"
+
+	// Tool name
+	toolStyle := GetToolStyle(proc.Tool)
+	titleStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+	if selected {
+		toolStyle = SessionStatusSelStyle
+		titleStyle = SessionTitleSelStyle
+	}
+
+	tool := toolStyle.Render(proc.Tool)
+
+	// TTY (compact)
+	ttyStr := ""
+	if proc.TTY != "" {
+		tty := proc.TTY
+		// Shorten /dev/pts/N to pts/N
+		if idx := strings.Index(tty, "pts/"); idx >= 0 {
+			tty = tty[idx:]
+		}
+		ttyStr = " " + tty
+	}
+
+	// Session name (slug or "(unknown)")
+	name := "(unknown)"
+	if proc.Slug != "" {
+		name = proc.Slug
+	}
+	nameRendered := titleStyle.Render(name)
+
+	// Project path (shortened)
+	projectPath := ""
+	if proc.ProjectPath != "" {
+		home, _ := os.UserHomeDir()
+		pp := proc.ProjectPath
+		if home != "" && strings.HasPrefix(pp, home) {
+			pp = "~" + pp[len(home):]
+		}
+		// Truncate long paths
+		if len(pp) > 20 {
+			pp = "..." + pp[len(pp)-17:]
+		}
+		projectPath = " " + pp
+	}
+
+	// Age
+	ageStr := ""
+	if !proc.StartTime.IsZero() {
+		age := time.Since(proc.StartTime)
+		switch {
+		case age < time.Minute:
+			ageStr = fmt.Sprintf(" %ds", int(age.Seconds()))
+		case age < time.Hour:
+			ageStr = fmt.Sprintf(" %dm", int(age.Minutes()))
+		case age < 24*time.Hour:
+			ageStr = fmt.Sprintf(" %dh", int(age.Hours()))
+		default:
+			ageStr = fmt.Sprintf(" %dd", int(age.Hours()/24))
+		}
+	}
+
+	dimStyle := DimStyle
+	if selected {
+		dimStyle = SessionStatusSelStyle
+	}
+
+	iconStyle := lipgloss.NewStyle().Foreground(ColorComment)
+	if selected {
+		iconStyle = SessionStatusSelStyle
+	}
+
+	row := fmt.Sprintf("%s %s %s%s %s%s%s",
+		selectionPrefix,
+		iconStyle.Render(extIcon),
+		tool,
+		dimStyle.Render(ttyStr),
+		nameRendered,
+		dimStyle.Render(projectPath),
+		dimStyle.Render(ageStr),
+	)
+	b.WriteString(row)
+	b.WriteString("\n")
 }
 
 // renderGroupItem renders a group header
@@ -8710,4 +9020,233 @@ func getSessionContent(inst *session.Instance) (string, error) {
 	}
 
 	return content, nil
+}
+
+// handleHistoryKey handles keyboard input when in history view mode
+func (h *Home) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "H", "q":
+		h.historyMode = false
+		return h, nil
+	case "up", "k":
+		if h.historyCursor > 0 {
+			h.historyCursor--
+			h.syncHistoryViewport()
+		}
+		return h, nil
+	case "down", "j":
+		if h.historyIndex != nil && h.historyCursor < len(h.historyIndex.Sessions)-1 {
+			h.historyCursor++
+			h.syncHistoryViewport()
+		}
+		return h, nil
+	case "ctrl+u": // Half page up
+		pageSize := h.getVisibleHeight() / 2
+		if pageSize < 1 {
+			pageSize = 1
+		}
+		h.historyCursor -= pageSize
+		if h.historyCursor < 0 {
+			h.historyCursor = 0
+		}
+		h.syncHistoryViewport()
+		return h, nil
+	case "ctrl+d": // Half page down
+		pageSize := h.getVisibleHeight() / 2
+		if pageSize < 1 {
+			pageSize = 1
+		}
+		h.historyCursor += pageSize
+		if h.historyIndex != nil && h.historyCursor >= len(h.historyIndex.Sessions) {
+			h.historyCursor = len(h.historyIndex.Sessions) - 1
+		}
+		if h.historyCursor < 0 {
+			h.historyCursor = 0
+		}
+		h.syncHistoryViewport()
+		return h, nil
+	}
+	return h, nil
+}
+
+// syncHistoryViewport ensures the history cursor is visible
+func (h *Home) syncHistoryViewport() {
+	visibleHeight := h.height - 6 // header + footer lines
+	if visibleHeight < 1 {
+		visibleHeight = 1
+	}
+	if h.historyCursor < h.historyScroll {
+		h.historyScroll = h.historyCursor
+	}
+	if h.historyCursor >= h.historyScroll+visibleHeight {
+		h.historyScroll = h.historyCursor - visibleHeight + 1
+	}
+}
+
+// renderHistoryView renders the full-screen history overlay
+func (h *Home) renderHistoryView() string {
+	var b strings.Builder
+
+	// Header
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
+	dimStyle := lipgloss.NewStyle().Foreground(ColorComment)
+	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+
+	sessionCount := 0
+	if h.historyIndex != nil {
+		sessionCount = len(h.historyIndex.Sessions)
+	}
+
+	headerLeft := titleStyle.Render(fmt.Sprintf(" Session History (%d sessions)", sessionCount))
+	headerRight := dimStyle.Render("[H] Back  [Esc] Close")
+	headerPad := h.width - lipgloss.Width(headerLeft) - lipgloss.Width(headerRight) - 2
+	if headerPad < 1 {
+		headerPad = 1
+	}
+	headerBar := lipgloss.NewStyle().
+		Background(ColorSurface).
+		MaxWidth(h.width).
+		Padding(0, 1).
+		Render(headerLeft + strings.Repeat(" ", headerPad) + headerRight)
+	b.WriteString(headerBar)
+	b.WriteString("\n")
+	b.WriteString(sepStyle.Render(strings.Repeat("─", max(0, h.width))))
+	b.WriteString("\n")
+
+	// Content area
+	contentHeight := h.height - 4 // header(1) + separator(1) + footer(2)
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+
+	if h.historyIndex == nil || len(h.historyIndex.Sessions) == 0 {
+		// Loading or empty state
+		loadingStyle := lipgloss.NewStyle().Foreground(ColorComment).Italic(true)
+		if h.historyIndex == nil {
+			b.WriteString(loadingStyle.Render("  Loading session history..."))
+		} else {
+			b.WriteString(loadingStyle.Render("  No historical sessions found"))
+		}
+		b.WriteString("\n")
+		content := ensureExactHeight(b.String(), h.height)
+		return lipgloss.NewStyle().MaxWidth(h.width).MaxHeight(h.height).Render(content)
+	}
+
+	// Group sessions by project path for display
+	sessions := h.historyIndex.Sessions
+
+	// Render visible sessions (simple flat list, sorted by recency)
+	visibleCount := 0
+	if h.historyScroll > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  ... +%d above", h.historyScroll)))
+		b.WriteString("\n")
+		contentHeight--
+	}
+
+	for i := h.historyScroll; i < len(sessions) && visibleCount < contentHeight; i++ {
+		sess := sessions[i]
+		selected := i == h.historyCursor
+
+		// Selection indicator
+		prefix := "  "
+		if selected {
+			prefix = SessionSelectionPrefix.Render("▶") + " "
+		}
+
+		// Age since last modified
+		age := time.Since(sess.LastModified)
+		var ageStr string
+		switch {
+		case age < time.Minute:
+			ageStr = fmt.Sprintf("%ds", int(age.Seconds()))
+		case age < time.Hour:
+			ageStr = fmt.Sprintf("%dm", int(age.Minutes()))
+		case age < 24*time.Hour:
+			ageStr = fmt.Sprintf("%dh", int(age.Hours()))
+		default:
+			ageStr = fmt.Sprintf("%dd", int(age.Hours()/24))
+		}
+
+		// Session ID (short)
+		shortID := sess.SessionID
+		if len(shortID) > 8 {
+			shortID = shortID[:8]
+		}
+
+		// Slug/name
+		name := sess.Slug
+		if name == "" {
+			name = "(unknown)"
+		}
+
+		// First prompt (truncated)
+		prompt := sess.FirstPrompt
+		if len(prompt) > 50 {
+			prompt = prompt[:47] + "..."
+		}
+		// Clean up newlines in prompt
+		prompt = strings.ReplaceAll(prompt, "\n", " ")
+
+		// Project path (shortened)
+		projectPath := sess.ProjectPath
+		home, _ := os.UserHomeDir()
+		if home != "" && strings.HasPrefix(projectPath, home) {
+			projectPath = "~" + projectPath[len(home):]
+		}
+
+		ageStyle := lipgloss.NewStyle().Foreground(ColorComment).Width(5).Align(lipgloss.Right)
+		idStyle := lipgloss.NewStyle().Foreground(ColorPurple)
+		nameStyle := lipgloss.NewStyle().Foreground(ColorCyan)
+		promptStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+		pathStyle := lipgloss.NewStyle().Foreground(ColorComment)
+
+		if selected {
+			selStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorBg).Background(ColorAccent)
+			ageStyle = selStyle
+			idStyle = selStyle
+			nameStyle = selStyle
+			promptStyle = selStyle
+			pathStyle = selStyle
+		}
+
+		row := fmt.Sprintf("%s%s %s %s %s %s",
+			prefix,
+			ageStyle.Render(ageStr),
+			idStyle.Render(shortID),
+			nameStyle.Render(name),
+			pathStyle.Render(projectPath),
+			promptStyle.Render(prompt),
+		)
+
+		// Truncate to width
+		if runewidth.StringWidth(row) > h.width {
+			row = runewidth.Truncate(row, h.width-1, "...")
+		}
+
+		b.WriteString(row)
+		b.WriteString("\n")
+		visibleCount++
+	}
+
+	// Show remaining count
+	remaining := len(sessions) - (h.historyScroll + visibleCount)
+	if remaining > 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  ... +%d below", remaining)))
+		b.WriteString("\n")
+	}
+
+	// Pad to exact height
+	content := ensureExactHeight(b.String(), h.height-2) // -2 for footer
+
+	// Footer
+	footerSep := sepStyle.Render(strings.Repeat("─", max(0, h.width)))
+	footerHints := dimStyle.Render("  [up/down] Navigate  [H/Esc] Back")
+	footer := footerSep + "\n" + footerHints
+
+	result := content + "\n" + footer
+
+	return lipgloss.NewStyle().
+		MaxWidth(h.width).
+		MaxHeight(h.height).
+		Render(result)
 }
