@@ -1228,6 +1228,7 @@ func (h *Home) Init() tea.Cmd {
 
 		h.tick(),
 		h.checkForUpdate(),
+		h.discoverExternalProcesses(), // Discover on startup (don't wait for first tick)
 	}
 
 	// Start listening for storage changes
@@ -7103,8 +7104,11 @@ func (h *Home) renderExternalItem(b *strings.Builder, item session.Item, selecte
 		selectionPrefix = SessionSelectionPrefix.Render("▶")
 	}
 
-	// External process icon (distinguishes from managed sessions)
-	extIcon := "⊙"
+	// Active status indicator (green dot = running process)
+	activeIndicator := lipgloss.NewStyle().Foreground(ColorGreen).Render("●")
+	if selected {
+		activeIndicator = SessionStatusSelStyle.Render("●")
+	}
 
 	// Tool name
 	toolStyle := GetToolStyle(proc.Tool)
@@ -7170,14 +7174,9 @@ func (h *Home) renderExternalItem(b *strings.Builder, item session.Item, selecte
 		dimStyle = SessionStatusSelStyle
 	}
 
-	iconStyle := lipgloss.NewStyle().Foreground(ColorComment)
-	if selected {
-		iconStyle = SessionStatusSelStyle
-	}
-
 	row := fmt.Sprintf("%s %s %s%s %s%s%s",
 		selectionPrefix,
-		iconStyle.Render(extIcon),
+		activeIndicator,
 		tool,
 		dimStyle.Render(ttyStr),
 		nameRendered,
