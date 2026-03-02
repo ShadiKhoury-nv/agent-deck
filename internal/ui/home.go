@@ -322,10 +322,10 @@ type Home struct {
 	lastExternalDiscovery    time.Time                 // Throttle discovery to every 10 seconds
 
 	// History view mode
-	historyMode   bool                        // True when viewing session history
-	historyIndex  *session.HistoryIndex       // Cached history index
-	historyCursor int                         // Cursor position in history view
-	historyScroll int                         // Scroll offset in history view
+	historyMode   bool                  // True when viewing session history
+	historyIndex  *session.HistoryIndex // Cached history index
+	historyCursor int                   // Cursor position in history view
+	historyScroll int                   // Scroll offset in history view
 }
 
 // reloadState preserves UI state during storage reload
@@ -3801,6 +3801,39 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// Toggle external section collapse
 				h.externalSectionCollapsed = !h.externalSectionCollapsed
 				h.rebuildFlatItems()
+			} else if item.Type == session.ItemTypeExternal && item.External != nil {
+				// Adopt external process into agent-deck management
+				ext := item.External
+				title := ext.Slug
+				if title == "" {
+					title = fmt.Sprintf("%s (PID %d)", ext.Tool, ext.PID)
+				}
+				projectPath := ext.ProjectPath
+				if projectPath == "" {
+					projectPath, _ = os.Getwd()
+				}
+				return h, func() tea.Msg {
+					inst := session.NewInstanceWithGroupAndTool(title, projectPath, "", ext.Tool)
+					inst.ClaudeSessionID = ext.SessionID
+
+					// Build resume command
+					var cmdBuilder strings.Builder
+					if session.IsClaudeConfigDirExplicit() {
+						configDir := session.GetClaudeConfigDir()
+						cmdBuilder.WriteString(fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir))
+					}
+					cmdBuilder.WriteString(ext.Tool)
+					if ext.SessionID != "" {
+						cmdBuilder.WriteString(" --resume ")
+						cmdBuilder.WriteString(ext.SessionID)
+					}
+					inst.Command = cmdBuilder.String()
+
+					if err := inst.Start(); err != nil {
+						return sessionCreatedMsg{err: fmt.Errorf("failed to adopt external process: %w", err)}
+					}
+					return sessionCreatedMsg{instance: inst}
+				}
 			}
 		}
 		return h, nil
@@ -7705,37 +7738,134 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		return h.renderGroupPreview(item.Group, width, height)
 	}
 
-	// External session items — render simple info (no Session object)
+	// External session items — render rich info (no Session object)
 	if item.Type == session.ItemTypeExternalHeader {
+		// Count external processes
+		extCount := 0
+		for _, fi := range h.flatItems {
+			if fi.Type == session.ItemTypeExternal {
+				extCount++
+			}
+		}
+		subtitle := fmt.Sprintf("%d agent process", extCount)
+		if extCount != 1 {
+			subtitle += "es"
+		}
+		subtitle += " running outside agent-deck"
 		return renderEmptyStateResponsive(EmptyStateConfig{
 			Icon:     "⊙",
 			Title:    "External Sessions",
-			Subtitle: "Agent processes running outside agent-deck",
+			Subtitle: subtitle,
 			Hints: []string{
 				"Press Enter to expand/collapse",
-				"Press a on a process to adopt it",
+				"Press Enter on a process to adopt it",
 			},
 		}, width, height)
 	}
 	if item.Type == session.ItemTypeExternal && item.External != nil {
 		var eb strings.Builder
+		ext := item.External
+
+		// Header with tool name and active badge
 		nameStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
-		infoStyle := lipgloss.NewStyle().Foreground(ColorText)
+		badgeStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorGreen)
+		labelStyle := lipgloss.NewStyle().Foreground(ColorTextDim).Width(10)
+		valueStyle := lipgloss.NewStyle().Foreground(ColorText)
 		dimStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
-		eb.WriteString(nameStyle.Render("⊙ "+item.External.Tool) + "\n")
-		eb.WriteString(infoStyle.Render("PID: "+fmt.Sprintf("%d", item.External.PID)) + "\n")
-		if item.External.ProjectPath != "" {
-			eb.WriteString(infoStyle.Render("Path: "+item.External.ProjectPath) + "\n")
+		sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+
+		// Tool icon + name + ACTIVE badge
+		toolIcon := "⊙"
+		eb.WriteString(nameStyle.Render(toolIcon + " " + ext.Tool))
+		eb.WriteString("  ")
+		eb.WriteString(badgeStyle.Render("● ACTIVE"))
+		eb.WriteString("\n")
+		eb.WriteString(sepStyle.Render(strings.Repeat("─", min(width-2, 40))))
+		eb.WriteString("\n\n")
+
+		// PID
+		eb.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("PID:"), valueStyle.Render(fmt.Sprintf("%d", ext.PID))))
+
+		// Project path
+		if ext.ProjectPath != "" {
+			pathStr := ext.ProjectPath
+			home, _ := os.UserHomeDir()
+			if home != "" && strings.HasPrefix(pathStr, home) {
+				pathStr = "~" + pathStr[len(home):]
+			}
+			eb.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Path:"), valueStyle.Render(truncatePath(pathStr, width-12))))
 		}
-		if item.External.TTY != "" {
-			eb.WriteString(infoStyle.Render("TTY: "+item.External.TTY) + "\n")
+
+		// TTY
+		if ext.TTY != "" {
+			eb.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("TTY:"), valueStyle.Render(ext.TTY)))
 		}
-		if item.External.Slug != "" {
-			eb.WriteString(infoStyle.Render("Session: "+item.External.Slug) + "\n")
+
+		// Session slug
+		if ext.Slug != "" {
+			eb.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Session:"), valueStyle.Render(ext.Slug)))
 		}
-		if item.External.SessionID != "" {
-			eb.WriteString(dimStyle.Render("ID: "+item.External.SessionID) + "\n")
+
+		// Start time with age
+		if !ext.StartTime.IsZero() {
+			age := time.Since(ext.StartTime)
+			var ageStr string
+			switch {
+			case age < time.Minute:
+				ageStr = "just started"
+			case age < time.Hour:
+				ageStr = fmt.Sprintf("%dm ago", int(age.Minutes()))
+			case age < 24*time.Hour:
+				ageStr = fmt.Sprintf("%dh %dm ago", int(age.Hours()), int(age.Minutes())%60)
+			default:
+				ageStr = fmt.Sprintf("%dd %dh ago", int(age.Hours()/24), int(age.Hours())%24)
+			}
+			eb.WriteString(fmt.Sprintf("%s %s (%s)\n", labelStyle.Render("Started:"), valueStyle.Render(ext.StartTime.Format("Jan 2 15:04")), ageStr))
 		}
+
+		// Last prompt (word-wrapped)
+		if ext.LastPrompt != "" {
+			eb.WriteString("\n")
+			eb.WriteString(dimStyle.Render("Last prompt:"))
+			eb.WriteString("\n")
+			prompt := strings.ReplaceAll(ext.LastPrompt, "\n", " ")
+			maxPromptWidth := width - 4
+			if maxPromptWidth < 20 {
+				maxPromptWidth = 20
+			}
+			if len(prompt) > maxPromptWidth*3 {
+				prompt = prompt[:maxPromptWidth*3-3] + "..."
+			}
+			// Simple word wrap
+			for len(prompt) > 0 {
+				lineLen := maxPromptWidth
+				if lineLen > len(prompt) {
+					lineLen = len(prompt)
+				}
+				// Try to break at a space
+				if lineLen < len(prompt) {
+					for i := lineLen; i > lineLen/2; i-- {
+						if prompt[i] == ' ' {
+							lineLen = i
+							break
+						}
+					}
+				}
+				eb.WriteString("  " + valueStyle.Render(strings.TrimSpace(prompt[:lineLen])) + "\n")
+				prompt = strings.TrimSpace(prompt[lineLen:])
+			}
+		}
+
+		// Session ID (dim, at bottom)
+		if ext.SessionID != "" {
+			eb.WriteString("\n")
+			shortID := ext.SessionID
+			if len(shortID) > 36 {
+				shortID = shortID[:36] + "..."
+			}
+			eb.WriteString(dimStyle.Render("ID: "+shortID) + "\n")
+		}
+
 		return eb.String()
 	}
 	if item.Type == session.ItemTypeExternal {
@@ -9081,6 +9211,22 @@ func (h *Home) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.syncHistoryViewport()
 		}
 		return h, nil
+	case "enter":
+		// Resume: create a new managed session that resumes this historical session
+		if h.historyIndex != nil && h.historyCursor >= 0 && h.historyCursor < len(h.historyIndex.Sessions) {
+			sel := h.historyIndex.Sessions[h.historyCursor]
+			h.historyMode = false
+			return h, h.adoptHistoricalSession(sel, true)
+		}
+		return h, nil
+	case "i":
+		// Import: create a tracked Instance without starting it
+		if h.historyIndex != nil && h.historyCursor >= 0 && h.historyCursor < len(h.historyIndex.Sessions) {
+			sel := h.historyIndex.Sessions[h.historyCursor]
+			h.historyMode = false
+			return h, h.adoptHistoricalSession(sel, false)
+		}
+		return h, nil
 	case "ctrl+u": // Half page up
 		pageSize := h.getVisibleHeight() / 2
 		if pageSize < 1 {
@@ -9108,6 +9254,46 @@ func (h *Home) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 	}
 	return h, nil
+}
+
+// adoptHistoricalSession creates a managed Instance from a HistoricalSession.
+// If start is true, the session is started immediately (resume). If false, it's
+// imported as a tracked but idle session.
+func (h *Home) adoptHistoricalSession(sel session.HistoricalSession, start bool) tea.Cmd {
+	title := sel.Slug
+	if title == "" {
+		shortID := sel.SessionID
+		if len(shortID) > 8 {
+			shortID = shortID[:8]
+		}
+		title = fmt.Sprintf("history-%s", shortID)
+	}
+	projectPath := sel.ProjectPath
+	if projectPath == "" {
+		projectPath, _ = os.Getwd()
+	}
+
+	return func() tea.Msg {
+		inst := session.NewInstanceWithGroupAndTool(title, projectPath, "", "claude")
+		inst.ClaudeSessionID = sel.SessionID
+
+		// Build resume command
+		var cmdBuilder strings.Builder
+		if session.IsClaudeConfigDirExplicit() {
+			configDir := session.GetClaudeConfigDir()
+			cmdBuilder.WriteString(fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir))
+		}
+		cmdBuilder.WriteString("claude --resume ")
+		cmdBuilder.WriteString(sel.SessionID)
+		inst.Command = cmdBuilder.String()
+
+		if start {
+			if err := inst.Start(); err != nil {
+				return sessionCreatedMsg{err: fmt.Errorf("failed to resume historical session: %w", err)}
+			}
+		}
+		return sessionCreatedMsg{instance: inst}
+	}
 }
 
 // syncHistoryViewport ensures the history cursor is visible
@@ -9139,7 +9325,7 @@ func (h *Home) renderHistoryView() string {
 	}
 
 	headerLeft := titleStyle.Render(fmt.Sprintf(" Session History (%d sessions)", sessionCount))
-	headerRight := dimStyle.Render("[H] Back  [Esc] Close")
+	headerRight := dimStyle.Render("[Enter] Resume  [i] Import  [H/Esc] Back")
 	headerPad := h.width - lipgloss.Width(headerLeft) - lipgloss.Width(headerRight) - 2
 	if headerPad < 1 {
 		headerPad = 1
@@ -9276,12 +9462,75 @@ func (h *Home) renderHistoryView() string {
 		b.WriteString("\n")
 	}
 
+	// Detail panel for selected session (bottom section)
+	detailHeight := 8
+	if h.historyCursor >= 0 && h.historyCursor < len(sessions) {
+		sel := sessions[h.historyCursor]
+		b.WriteString(sepStyle.Render(strings.Repeat("─", max(0, h.width))))
+		b.WriteString("\n")
+
+		detailLabel := lipgloss.NewStyle().Foreground(ColorTextDim).Width(12)
+		detailValue := lipgloss.NewStyle().Foreground(ColorText)
+		detailAccent := lipgloss.NewStyle().Foreground(ColorCyan)
+
+		// Session name
+		name := sel.Slug
+		if name == "" {
+			name = sel.SessionID
+		}
+		b.WriteString("  " + detailAccent.Render(name) + "\n")
+
+		// First prompt
+		if sel.FirstPrompt != "" {
+			fp := strings.ReplaceAll(sel.FirstPrompt, "\n", " ")
+			if len(fp) > h.width-14 {
+				fp = fp[:h.width-17] + "..."
+			}
+			b.WriteString(fmt.Sprintf("  %s %s\n", detailLabel.Render("First:"), detailValue.Render(fp)))
+		}
+		// Last prompt
+		if sel.LastPrompt != "" {
+			lp := strings.ReplaceAll(sel.LastPrompt, "\n", " ")
+			if len(lp) > h.width-14 {
+				lp = lp[:h.width-17] + "..."
+			}
+			b.WriteString(fmt.Sprintf("  %s %s\n", detailLabel.Render("Last:"), detailValue.Render(lp)))
+		}
+		// Stats line: messages, file size, git branch
+		var stats []string
+		if sel.MessageCount > 0 {
+			stats = append(stats, fmt.Sprintf("%d messages", sel.MessageCount))
+		}
+		if sel.FileSize > 0 {
+			if sel.FileSize > 1024*1024 {
+				stats = append(stats, fmt.Sprintf("%.1f MB", float64(sel.FileSize)/(1024*1024)))
+			} else {
+				stats = append(stats, fmt.Sprintf("%.1f KB", float64(sel.FileSize)/1024))
+			}
+		}
+		if sel.GitBranch != "" {
+			stats = append(stats, "branch: "+sel.GitBranch)
+		}
+		if len(stats) > 0 {
+			b.WriteString(fmt.Sprintf("  %s %s\n", detailLabel.Render("Stats:"), dimStyle.Render(strings.Join(stats, "  ·  "))))
+		}
+		// Dates
+		b.WriteString(fmt.Sprintf("  %s %s\n", detailLabel.Render("Created:"), dimStyle.Render(sel.CreatedAt.Format("Jan 2, 2006 15:04"))))
+		b.WriteString(fmt.Sprintf("  %s %s\n", detailLabel.Render("Modified:"), dimStyle.Render(sel.LastModified.Format("Jan 2, 2006 15:04"))))
+		// Version
+		if sel.ClaudeVersion != "" {
+			b.WriteString(fmt.Sprintf("  %s %s\n", detailLabel.Render("Version:"), dimStyle.Render(sel.ClaudeVersion)))
+		}
+	} else {
+		detailHeight = 0
+	}
+
 	// Pad to exact height
-	content := ensureExactHeight(b.String(), h.height-2) // -2 for footer
+	content := ensureExactHeight(b.String(), h.height-2-detailHeight) // -2 for footer, -detailHeight for detail panel
 
 	// Footer
 	footerSep := sepStyle.Render(strings.Repeat("─", max(0, h.width)))
-	footerHints := dimStyle.Render("  [up/down] Navigate  [H/Esc] Back")
+	footerHints := dimStyle.Render("  [up/down] Navigate  [Enter] Resume  [i] Import  [H/Esc] Back")
 	footer := footerSep + "\n" + footerHints
 
 	result := content + "\n" + footer
