@@ -7705,6 +7705,47 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		return h.renderGroupPreview(item.Group, width, height)
 	}
 
+	// External session items — render simple info (no Session object)
+	if item.Type == session.ItemTypeExternalHeader {
+		return renderEmptyStateResponsive(EmptyStateConfig{
+			Icon:     "⊙",
+			Title:    "External Sessions",
+			Subtitle: "Agent processes running outside agent-deck",
+			Hints: []string{
+				"Press Enter to expand/collapse",
+				"Press a on a process to adopt it",
+			},
+		}, width, height)
+	}
+	if item.Type == session.ItemTypeExternal && item.External != nil {
+		var eb strings.Builder
+		nameStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
+		infoStyle := lipgloss.NewStyle().Foreground(ColorText)
+		dimStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+		eb.WriteString(nameStyle.Render("⊙ "+item.External.Tool) + "\n")
+		eb.WriteString(infoStyle.Render("PID: "+fmt.Sprintf("%d", item.External.PID)) + "\n")
+		if item.External.ProjectPath != "" {
+			eb.WriteString(infoStyle.Render("Path: "+item.External.ProjectPath) + "\n")
+		}
+		if item.External.TTY != "" {
+			eb.WriteString(infoStyle.Render("TTY: "+item.External.TTY) + "\n")
+		}
+		if item.External.Slug != "" {
+			eb.WriteString(infoStyle.Render("Session: "+item.External.Slug) + "\n")
+		}
+		if item.External.SessionID != "" {
+			eb.WriteString(dimStyle.Render("ID: "+item.External.SessionID) + "\n")
+		}
+		return eb.String()
+	}
+	if item.Type == session.ItemTypeExternal {
+		return renderEmptyStateResponsive(EmptyStateConfig{
+			Icon:     "⊙",
+			Title:    "External Process",
+			Subtitle: "No details available",
+		}, width, height)
+	}
+
 	// Session preview
 	selected := item.Session
 
