@@ -106,8 +106,9 @@ func inspectProcPID(pid int, managedSessionIDs map[string]bool) (ExternalProcess
 
 	// Skip sandbox wrappers — bwrap cmdlines contain "/tmp/claude" as a directory
 	// path (e.g., --bind /tmp/claude /tmp/claude), which false-matches "claude" basename.
+	// Note: DO NOT skip "node" — Claude Code runs as `node /path/to/claude`.
 	firstBase := filepath.Base(args[0])
-	if firstBase == "bwrap" || firstBase == "socat" || firstBase == "bash" || firstBase == "sh" {
+	if firstBase == "bwrap" || firstBase == "socat" {
 		return ExternalProcess{}, false
 	}
 
@@ -207,29 +208,46 @@ func splitNull(data []byte) []string {
 
 // isAgentProcess checks if any arg's basename matches a known agent tool.
 // Returns (toolName, true) if found.
+// knownInterpreters are runtimes that may launch agent tools as scripts.
+// When arg[0] is an interpreter, arg[1] is treated as the script/executable.
+var knownInterpreters = map[string]bool{
+	"node": true, "nodejs": true, "deno": true, "bun": true,
+	"python3": true, "python": true,
+}
+
 func isAgentProcess(args []string) (string, bool) {
-	// Only check the first arg (the executable) and any arg that starts with
-	// a typical bin path. Avoid matching directory paths like "/tmp/claude".
-	for i, arg := range args {
-		base := filepath.Base(arg)
-		for _, tool := range knownAgentTools {
-			if base == tool {
-				// For arg[0], always trust it (it's the executable)
-				if i == 0 {
-					return tool, true
-				}
-				// For other args, only match if the arg looks like an executable path
-				// (contains /bin/ or /node_modules/.bin/) not a plain directory
-				if strings.Contains(arg, "/bin/") || strings.Contains(arg, "node_modules") {
-					return tool, true
-				}
-				// Also match bare command names (no path component)
-				if !strings.Contains(arg, "/") {
+	if len(args) == 0 {
+		return "", false
+	}
+
+	firstBase := filepath.Base(args[0])
+
+	// Direct match: arg[0] IS the agent tool (e.g., /usr/bin/claude)
+	for _, tool := range knownAgentTools {
+		if firstBase == tool {
+			return tool, true
+		}
+	}
+
+	// Interpreter match: arg[0] is node/deno/bun/python, check arg[1..2] for the script.
+	// Claude Code runs as: node /home/user/.claude/local/claude
+	// Deno may run as: deno run /path/to/gemini
+	if knownInterpreters[firstBase] {
+		// Check first few args after the interpreter (skip flags like "run", "--allow-net")
+		limit := len(args)
+		if limit > 4 {
+			limit = 4 // don't scan too many args
+		}
+		for _, arg := range args[1:limit] {
+			scriptBase := filepath.Base(arg)
+			for _, tool := range knownAgentTools {
+				if scriptBase == tool {
 					return tool, true
 				}
 			}
 		}
 	}
+
 	return "", false
 }
 

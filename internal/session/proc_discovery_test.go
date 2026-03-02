@@ -77,6 +77,28 @@ func TestIsAgentProcess(t *testing.T) {
 			args:   []string{"claude-code"},
 			wantOK: false,
 		},
+		{
+			name:     "node running claude from .claude/local (real Claude Code path)",
+			args:     []string{"node", "/home/user/.claude/local/claude"},
+			wantTool: "claude",
+			wantOK:   true,
+		},
+		{
+			name:   "bwrap with /tmp/claude directory arg is NOT a match",
+			args:   []string{"bwrap", "--bind", "/tmp/claude", "/tmp/claude"},
+			wantOK: false,
+		},
+		{
+			name:   "bash script is not a match even with claude in later args",
+			args:   []string{"bash", "-c", "source /tmp/claude/env.sh"},
+			wantOK: false,
+		},
+		{
+			name:     "deno running gemini",
+			args:     []string{"deno", "run", "/opt/gemini"},
+			wantTool: "gemini",
+			wantOK:   true,
+		},
 	}
 
 	for _, tt := range tests {
