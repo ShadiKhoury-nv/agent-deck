@@ -3803,7 +3803,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.externalSectionCollapsed = !h.externalSectionCollapsed
 				h.rebuildFlatItems()
 			} else if item.Type == session.ItemTypeExternal && item.External != nil {
-				// Adopt external process into agent-deck management
+				// Adopt external process into tracking (do NOT start a new session —
+				// the process is already running in another terminal)
 				ext := item.External
 				title := ext.Slug
 				if title == "" {
@@ -3813,11 +3814,17 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if projectPath == "" {
 					projectPath, _ = os.Getwd()
 				}
+
+				ttyInfo := ext.TTY
+				if idx := strings.Index(ttyInfo, "pts/"); idx >= 0 {
+					ttyInfo = ttyInfo[idx:]
+				}
+
 				return h, func() tea.Msg {
 					inst := session.NewInstanceWithGroupAndTool(title, projectPath, "", ext.Tool)
 					inst.ClaudeSessionID = ext.SessionID
 
-					// Build resume command
+					// Build resume command (for future restart, not started now)
 					var cmdBuilder strings.Builder
 					if session.IsClaudeConfigDirExplicit() {
 						configDir := session.GetClaudeConfigDir()
@@ -3830,9 +3837,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 					inst.Command = cmdBuilder.String()
 
-					if err := inst.Start(); err != nil {
-						return sessionCreatedMsg{err: fmt.Errorf("failed to adopt external process: %w", err)}
-					}
+					// Don't call inst.Start() — session is already running on ttyInfo
 					return sessionCreatedMsg{instance: inst}
 				}
 			}
@@ -7757,7 +7762,8 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			Subtitle: subtitle,
 			Hints: []string{
 				"Press Enter to expand/collapse",
-				"Press Enter on a process to adopt it",
+				"Press Enter on a process to track it",
+				"Session keeps running in its terminal",
 			},
 		}, width, height)
 	}
@@ -7863,6 +7869,20 @@ func (h *Home) renderPreviewPane(width, height int) string {
 				shortID = shortID[:36] + "..."
 			}
 			eb.WriteString(dimStyle.Render("ID: "+shortID) + "\n")
+		}
+
+		// Action hint
+		eb.WriteString("\n")
+		eb.WriteString(sepStyle.Render(strings.Repeat("─", min(width-2, 40))))
+		eb.WriteString("\n")
+		hintStyle := lipgloss.NewStyle().Foreground(ColorComment).Italic(true)
+		eb.WriteString(hintStyle.Render("Enter: track this session") + "\n")
+		if ext.TTY != "" {
+			tty := ext.TTY
+			if idx := strings.Index(tty, "pts/"); idx >= 0 {
+				tty = tty[idx:]
+			}
+			eb.WriteString(hintStyle.Render(fmt.Sprintf("Running on %s — switch to that terminal", tty)) + "\n")
 		}
 
 		return eb.String()
